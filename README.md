@@ -108,7 +108,7 @@ There is no error signalling — `finish()` always terminates cleanly. If you ne
 
 ```swift
 dependencies: [
-    .package(url: "<repo-url>", from: "<version>")
+    .package(url: "https://github.com/bencmorrison/swift-asyncsubjects", from: "1.0.0")
 ]
 ```
 

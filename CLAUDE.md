@@ -17,7 +17,7 @@ swift build
 swift test
 ```
 
-All 52 tests must pass before any change is considered done.
+All 58 tests must pass before any change is considered done.
 
 ## Architecture
 
@@ -26,7 +26,11 @@ All 52 tests must pass before any change is considered done.
 2. Subscribes to the passthrough *before* returning (prevents missed values)
 3. Wraps both in an `AsyncStream` that yields the cached value first, then forwards from passthrough via a `Task`
 
-`PassthroughStream` stores `AsyncStream.Continuation` values keyed by `UUID`. Continuations are registered in `stream()` and cleaned up via `onTermination`.
+`PassthroughStream` stores `AsyncStream.Continuation` values keyed by `StreamID`. Continuations are registered in `stream()` and cleaned up via `onTermination`. Callers must call `finish()` when the stream is no longer needed — this calls `.finish()` on all active continuations so subscriber `for await` loops exit cleanly. Without `finish()`, active `for await` loops suspend indefinitely.
+
+`StreamID` is defined in `StreamID.swift` using conditional compilation:
+- `UUID` when `Foundation` or `FoundationEssentials` is available (Apple platforms, Linux, Windows)
+- `InternalStreamID` (atomic `UInt64` counter) as a fallback for platforms without Foundation
 
 ## Key Decisions
 
@@ -34,6 +38,7 @@ All 52 tests must pass before any change is considered done.
 - `send()` is `async` on both types for consistency. Callers must `await`.
 - `.dropped` yield results are handled explicitly but non-fatally — a comment explains the value was lost due to a full subscriber buffer. The continuation is retained.
 - No completion or error signalling by design. Subscribers cancel themselves.
+- No `platforms` array in `Package.swift` — the package targets all Swift platforms. Availability is expressed via `@available(macOS 12, iOS 15, tvOS 15, watchOS 8, *)` on the actor declarations (the `*` covers Linux/Windows).
 
 ## Test Helpers
 

@@ -1,7 +1,5 @@
 // Copyright © 2025 Ben Morrison. All rights reserved.
 
-import Foundation
-
 /// An actor that broadcasts values to multiple subscribers using Swift concurrency.
 ///
 /// `PassthroughStream` provides similar functionality to Combine's `PassthroughSubject`,
@@ -42,12 +40,12 @@ import Foundation
 /// Each stream automatically cleans up its continuation when the subscriber stops iterating,
 /// preventing memory leaks even if subscribers are cancelled or deallocated.
 ///
-/// ## Completion and Error Signalling
+/// ## Completion
 ///
-/// There is no way for the producer to signal completion or error — subscribers iterate
-/// indefinitely until they cancel. This differs from Combine's `PassthroughSubject`, which
-/// supports `send(completion:)`. If you need finite streams, cancel the subscriber's task
-/// or break out of the `for await` loop on your own condition.
+/// Call `finish()` when the stream is no longer needed. This terminates all active subscriber
+/// `for await` loops cleanly. Without calling `finish()`, any active `for await` loops will
+/// suspend indefinitely once the stream is no longer in use — they will not exit on their own
+/// unless the subscribing task is cancelled separately.
 ///
 /// - Important: Values are only delivered to active subscribers. If you need to cache
 ///   the most recent value for new subscribers, use ``CurrentValueStream`` instead.
@@ -56,31 +54,37 @@ import Foundation
 ///   which guarantees serialised access to its mutable state. The conformance is therefore
 ///   safe, but the compiler cannot verify it automatically when `actor` types also declare
 ///   explicit `Sendable` conformance via inheritance or protocol composition.
+@available(macOS 12, iOS 15, tvOS 15, watchOS 8, *)
 actor PassthroughStream<Value: Sendable>: @unchecked Sendable {
-  private var continuations: [UUID: AsyncStream<Value>.Continuation] = [:]
+  private var continuations: [StreamID: AsyncStream<Value>.Continuation] = [:]
 
-  /// Creates a new async stream that receives values sent to this passthrough stream.
+  /// Creates a new async stream that receives all values broadcast after this call.
   ///
-  /// Each call to this method creates an independent stream. All streams created from
-  /// the same `PassthroughStream` instance will receive identical values when `send(_:)` is called.
+  /// Each call returns an independent `AsyncStream`. Values sent via `send(_:)` before
+  /// this call are not delivered — subscribers only receive values sent after they begin
+  /// observing. If you need new subscribers to receive the most recent value immediately,
+  /// use ``CurrentValueStream`` instead.
   ///
   /// The stream automatically unregisters itself when the subscriber stops iterating,
-  /// either normally or through cancellation.
+  /// either normally or through task cancellation.
   ///
   /// - Returns: An `AsyncStream` that yields values of type `Value`.
   ///
   /// ## Example
   ///
   /// ```swift
-  /// let stream = PassthroughStream<Int>()
-  /// let numbers = await stream.stream()
+  /// let stream = PassthroughStream<String>()
   ///
-  /// for await number in numbers {
-  ///     print(number)
+  /// Task {
+  ///     for await message in await stream.stream() {
+  ///         print(message)
+  ///     }
   /// }
+  ///
+  /// await stream.send("Hello") // Received by the subscriber above
   /// ```
   func stream() -> AsyncStream<Value> {
-    let id = UUID()
+    let id = StreamID()
 
     return AsyncStream { continuation in
       addContinuation(continuation, id: id)
@@ -92,11 +96,11 @@ actor PassthroughStream<Value: Sendable>: @unchecked Sendable {
     }
   }
 
-  private func addContinuation(_ continuation: AsyncStream<Value>.Continuation, id: UUID) {
+  private func addContinuation(_ continuation: AsyncStream<Value>.Continuation, id: StreamID) {
     continuations[id] = continuation
   }
 
-  private func removeContinuation(id: UUID) {
+  private func removeContinuation(id: StreamID) {
     continuations.removeValue(forKey: id)
   }
 
@@ -124,7 +128,7 @@ actor PassthroughStream<Value: Sendable>: @unchecked Sendable {
   /// - Note: This operation completes immediately and does not wait for subscribers
   ///   to process the value.
   func send(_ value: Value) async {
-    let terminatedIds = continuations.compactMap { id, continuation -> UUID? in
+    let terminatedIds = continuations.compactMap { id, continuation -> StreamID? in
       switch continuation.yield(value) {
       case .terminated:
         return id
@@ -137,5 +141,14 @@ actor PassthroughStream<Value: Sendable>: @unchecked Sendable {
       }
     }
     terminatedIds.forEach { continuations.removeValue(forKey: $0) }
+  }
+
+  /// Finishes all active subscriber streams, causing their `for await` loops to exit.
+  ///
+  /// Call this when the stream is no longer needed. All continuations are finished and
+  /// the internal dictionary is cleared.
+  func finish() {
+    continuations.values.forEach { $0.finish() }
+    continuations.removeAll()
   }
 }

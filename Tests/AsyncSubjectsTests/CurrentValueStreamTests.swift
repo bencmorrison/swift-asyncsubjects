@@ -699,12 +699,12 @@ struct CurrentValueStreamTests {
     #expect(results[1] == ["B", "B1", "B2"], "Second stream should only see its own values")
   }
 
-  // MARK: - Deallocation Tests
+  // MARK: - Finish Tests
 
-  @Test("Subscriber can be cancelled when CurrentValueStream is deallocated")
-  func subscriberCanBeCancelledOnDeallocation() async {
-    var optionalStream: CurrentValueStream<Int>? = CurrentValueStream<Int>(1)
-    let asyncStream = await optionalStream!.stream()
+  @Test("Subscriber stream ends when finish() is called")
+  func subscriberEndsOnFinish() async {
+    let stream = CurrentValueStream<Int>(1)
+    let asyncStream = await stream.stream()
 
     let collectedTask = Task {
       var values: [Int] = []
@@ -714,20 +714,145 @@ struct CurrentValueStreamTests {
       return values
     }
 
-    // Send a value while alive
-    await optionalStream!.send(2)
+    // Send a value, then finish
+    await stream.send(2)
+    await stream.finish()
 
-    // Deallocate — the internal PassthroughStream is also released. The forwarder
-    // task inside stream() will eventually be cancelled, which finishes the outer
-    // continuation. Cancel the collecting task to unblock it and verify no hang.
-    optionalStream = nil
-
-    try? await Task.sleep(for: .milliseconds(50))
-
-    collectedTask.cancel()
+    // The for-await loop should exit on its own after finish()
     let values = await collectedTask.value
     #expect(values.contains(1), "Should have received the initial value")
-    #expect(values.contains(2), "Should have received the value sent before deallocation")
+    #expect(values.contains(2), "Should have received the value sent before finish()")
+  }
+
+  @Test("finish() propagates to all active subscribers")
+  func finishPropagatestoAllSubscribers() async {
+    let stream = CurrentValueStream<Int>(0)
+
+    let asyncStream1 = await stream.stream()
+    let asyncStream2 = await stream.stream()
+
+    let task1 = Task {
+      var values: [Int] = []
+      for await value in asyncStream1 { values.append(value) }
+      return values
+    }
+
+    let task2 = Task {
+      var values: [Int] = []
+      for await value in asyncStream2 { values.append(value) }
+      return values
+    }
+
+    await stream.send(1)
+    await stream.finish()
+
+    let values1 = await task1.value
+    let values2 = await task2.value
+
+    #expect(values1.contains(0) && values1.contains(1), "Subscriber 1 should receive values before finish()")
+    #expect(values2.contains(0) && values2.contains(1), "Subscriber 2 should receive values before finish()")
+  }
+
+  // MARK: - Concurrent Correctness Tests
+
+  @Test("Concurrent subscribes and sends produce no value loss for initial value")
+  func concurrentSubscribesAndSendsNoValueLoss() async throws {
+    let stream = CurrentValueStream<Int>(0)
+
+    // 5 subscribers each collect just the first value they see (the current value at subscribe time)
+    // Concurrently interleaved with sends of 1–10
+    let subscriberResults: [[Int]] = try await withThrowingTaskGroup(of: [Int].self) { group in
+      // Concurrently send values 1–10
+      for i in 1...10 {
+        group.addTask { await stream.send(i); return [] }
+      }
+
+      // 5 subscribers each collect their first value only — avoids hanging on iterator.next()
+      for _ in 0..<5 {
+        group.addTask {
+          let collector = StreamCollector<Int>()
+          let asyncStream = await stream.stream()
+          return try await collector.collect(from: asyncStream, count: 1, timeout: .seconds(3))
+        }
+      }
+
+      var results: [[Int]] = []
+      for try await result in group where !result.isEmpty {
+        results.append(result)
+      }
+      return results
+    }
+
+    #expect(subscriberResults.count == 5, "All 5 subscribers should complete")
+    for values in subscriberResults {
+      #expect(values.count == 1, "Each subscriber should receive exactly 1 value")
+      #expect((0...10).contains(values[0]), "First value must be from the expected set (0 = initial, 1–10 = sent)")
+    }
+  }
+
+  @Test("Many forwarder tasks clean up safely")
+  func manyForwarderTasksCleanUpSafely() async throws {
+    let stream = CurrentValueStream<Int>(0)
+
+    // 50 concurrent tasks each consume one value then drop the iterator
+    try await withThrowingTaskGroup(of: Void.self) { outerGroup in
+      outerGroup.addTask {
+        await withTaskGroup(of: Void.self) { group in
+          for _ in 0..<50 {
+            group.addTask {
+              let asyncStream = await stream.stream()
+              var iterator = asyncStream.makeAsyncIterator()
+              _ = await iterator.next()
+              // iterator dropped here — triggers onTermination -> forwarder cancel
+            }
+          }
+          await group.waitForAll()
+        }
+      }
+
+      outerGroup.addTask {
+        try await Task.sleep(for: .seconds(3))
+        throw StreamCollector<Int>.CollectionError.timeout
+      }
+
+      try await outerGroup.next()
+      outerGroup.cancelAll()
+    }
+
+    // After all 50 tasks complete, verify the stream is still usable
+    let collector = StreamCollector<Int>()
+    let freshStream = await stream.stream()
+    async let collected = collector.collect(from: freshStream, count: 2, timeout: .seconds(2))
+    await stream.send(99)
+    let values = try await collected
+    let currentStreamValue = await stream.value
+    #expect(values.first == currentStreamValue || values.contains(99),
+            "Stream must be usable after 50 concurrent forwarder create/destroy cycles")
+  }
+
+  @Test("Concurrent sends maintain consistency")
+  func concurrentSendsMaintainConsistency() async throws {
+    let stream = CurrentValueStream<Int>(0)
+    let asyncStream = await stream.stream()
+    let collector = StreamCollector<Int>()
+
+    // Collect initial value + up to 20 more with a generous timeout
+    async let collectedTask = collector.collectUntilTimeout(from: asyncStream, timeout: .milliseconds(500))
+
+    // Concurrently send 20 values
+    await withTaskGroup(of: Void.self) { group in
+      for i in 1...20 {
+        group.addTask { await stream.send(i) }
+      }
+    }
+
+    let values = await collectedTask
+
+    // No value should appear more than once
+    #expect(values.count == Set(values).count, "No value should appear more than once")
+
+    // All values must be within 0–20
+    #expect(values.allSatisfy { (0...20).contains($0) }, "All values must be within the expected set 0–20")
   }
 
   // MARK: - Performance Tests

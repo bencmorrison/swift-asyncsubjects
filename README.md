@@ -39,26 +39,68 @@ await state.send("loading")
 let current = await state.value
 ```
 
+## Finishing
+
+Both types require an explicit call to `finish()` when they are no longer needed. This causes all active `for await` loops to exit cleanly.
+
+```swift
+let events = PassthroughStream<String>()
+
+Task {
+    for await event in await events.stream() {
+        print(event)
+    }
+    print("Stream finished") // Reached after finish() is called
+}
+
+await events.send("hello")
+await events.finish() // All subscriber loops exit
+```
+
+Without calling `finish()`, active subscribers will suspend indefinitely unless their enclosing task is cancelled separately.
+
+Both `finish()` calls require `await` at the call site due to actor isolation. `CurrentValueStream.finish()` is additionally marked `async` in its signature because it must hop to the internal `PassthroughStream` actor:
+
+```swift
+let state = CurrentValueStream<Int>(0)
+// ... use the stream ...
+await state.finish()
+```
+
+## Multiple Subscribers
+
+Both types support any number of concurrent subscribers. All active subscribers receive each value sent.
+
+```swift
+let stream = PassthroughStream<Int>()
+
+Task { for await n in await stream.stream() { print("A: \(n)") } }
+Task { for await n in await stream.stream() { print("B: \(n)") } }
+
+await stream.send(1) // Both A and B receive 1
+await stream.send(2) // Both A and B receive 2
+await stream.finish()
+```
+
 ## Key Differences from Combine
 
 | | `PassthroughStream` | `PassthroughSubject` |
 |---|---|---|
 | Initial value for new subscribers | None | None |
-| Completion/error signalling | No | Yes |
+| Completion/error signalling | `finish()` only | `send(completion:)` with error |
 | Thread safety | Actor-isolated | Requires manual synchronisation |
 
 | | `CurrentValueStream` | `CurrentValueSubject` |
 |---|---|---|
 | Initial value for new subscribers | Yes | Yes |
-| Completion/error signalling | No | Yes |
+| Completion/error signalling | `finish()` only | `send(completion:)` with error |
 | Thread safety | Actor-isolated | Requires manual synchronisation |
 
-Subscribers iterate indefinitely until they cancel their task or break out of the `for await` loop. There is no `send(completion:)`.
+There is no error signalling — `finish()` always terminates cleanly. If you need error propagation, cancel the subscribing task and handle errors out-of-band.
 
 ## Requirements
 
 - Swift 6.2+
-- iOS 13+ / macOS 12+ / tvOS 13+ / watchOS 10+ / visionOS 1+
 
 ## Installation
 

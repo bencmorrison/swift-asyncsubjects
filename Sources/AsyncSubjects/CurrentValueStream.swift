@@ -1,7 +1,5 @@
 // Copyright © 2025 Ben Morrison. All rights reserved.
 
-import Foundation
-
 /// An actor that broadcasts values to multiple subscribers and caches the most recent value.
 ///
 /// `CurrentValueStream` provides similar functionality to Combine's `CurrentValueSubject`,
@@ -47,12 +45,13 @@ import Foundation
 /// Each stream automatically cleans up when subscribers stop iterating, preventing
 /// memory leaks even if subscribers are cancelled or deallocated.
 ///
-/// ## Completion and Error Signalling
+/// ## Completion
 ///
-/// There is no way for the producer to signal completion or error — subscribers iterate
-/// indefinitely until they cancel. This differs from Combine's `CurrentValueSubject`, which
-/// supports `send(completion:)`. If you need finite streams, cancel the subscriber's task
-/// or break out of the `for await` loop on your own condition.
+/// Call `finish()` when the stream is no longer needed. This delegates to the internal
+/// `PassthroughStream`, terminating all active subscriber `for await` loops cleanly.
+/// Without calling `finish()`, any active `for await` loops will suspend indefinitely
+/// once the stream is no longer in use — they will not exit on their own unless the
+/// subscribing task is cancelled separately.
 ///
 /// - Important: Unlike ``PassthroughStream``, new subscribers immediately receive the
 ///   current value. If you don't need this behavior, use ``PassthroughStream`` instead
@@ -62,6 +61,7 @@ import Foundation
 ///   which guarantees serialised access to its mutable state. The conformance is therefore
 ///   safe, but the compiler cannot verify it automatically when `actor` types also declare
 ///   explicit `Sendable` conformance via inheritance or protocol composition.
+@available(macOS 12, iOS 15, tvOS 15, watchOS 8, *)
 actor CurrentValueStream<Value: Sendable>: @unchecked Sendable {
   /// The most recently sent value.
   ///
@@ -188,5 +188,13 @@ actor CurrentValueStream<Value: Sendable>: @unchecked Sendable {
   func send(_ value: Value) async {
     self.value = value
     await passthrough.send(value)
+  }
+
+  /// Finishes all active subscriber streams, causing their `for await` loops to exit.
+  ///
+  /// Delegates to the internal `PassthroughStream`. Call this when the stream is no
+  /// longer needed.
+  func finish() async {
+    await passthrough.finish()
   }
 }

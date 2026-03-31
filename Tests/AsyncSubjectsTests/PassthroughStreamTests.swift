@@ -495,6 +495,132 @@ struct PassthroughStreamTests {
     #expect(values == Array(0..<100), "Values must arrive in send order")
   }
 
+  // MARK: - Drop and Slow Subscriber Tests
+
+  @Test("Slow subscriber survives dropped values")
+  func slowSubscriberSurvivesDroppedValues() async throws {
+    let stream = PassthroughStream<Int>()
+    let asyncStream = await stream.stream()
+
+    // Slow subscriber: pull first value, sleep 300ms, then pull again
+    let subscriberTask = Task<[Int], Never> {
+      var received: [Int] = []
+      var iterator = asyncStream.makeAsyncIterator()
+
+      if let first = await iterator.next() {
+        received.append(first)
+      }
+
+      // Sleep while the sender is firing
+      try? await Task.sleep(for: .milliseconds(300))
+
+      // Pull whatever is next (if anything is buffered or arrives)
+      if let next = await iterator.next() {
+        received.append(next)
+      }
+
+      return received
+    }
+
+    // Send the first value so the subscriber can grab it
+    await stream.send(0)
+
+    // Rapidly send more while the subscriber is sleeping — these may be dropped
+    for i in 1..<10 {
+      await stream.send(i)
+    }
+
+    // Wait for the slow subscriber to finish its 300ms sleep and second pull
+    // Send one more value to ensure something is available after the sleep
+    try await Task.sleep(for: .milliseconds(350))
+    await stream.send(99)
+
+    let values = await subscriberTask.value
+
+    #expect(values.first == 0, "Subscriber must receive the first value")
+    #expect(values.count >= 1, "Subscriber should have received at least one value")
+
+    // Verify the stream is still functional after dropped yields
+    let collector = StreamCollector<Int>()
+    let freshStream = await stream.stream()
+    async let collected = collector.collect(from: freshStream, count: 1, timeout: .seconds(2))
+    await stream.send(100)
+    let freshValues = try await collected
+    #expect(freshValues == [100], "Stream must still be functional after slow subscriber experienced drops")
+  }
+
+  @Test("Rapid stream creation and cancellation does not crash or leak")
+  func rapidStreamCreationAndCancellation() async throws {
+    let stream = PassthroughStream<Int>()
+
+    // Repeatedly create a stream and immediately cancel the consuming task
+    for _ in 0..<100 {
+      let asyncStream = await stream.stream()
+      let task = Task {
+        for await _ in asyncStream {}
+      }
+      task.cancel()
+    }
+
+    // Allow cancellation cleanup to propagate
+    try await Task.sleep(for: .milliseconds(200))
+
+    // The stream must still be functional
+    let collector = StreamCollector<Int>()
+    let finalStream = await stream.stream()
+    async let collected = collector.collect(from: finalStream, count: 1, timeout: .seconds(2))
+    await stream.send(42)
+    let values = try await collected
+    #expect(values == [42], "Stream must remain functional after 100 rapid create/cancel cycles")
+  }
+
+  @Test("Rapid sends with slow subscriber verifies drop behaviour")
+  func rapidSendsWithSlowSubscriberVerifiesDropBehaviour() async throws {
+    let stream = PassthroughStream<Int>()
+    let asyncStream = await stream.stream()
+
+    let subscriberTask = Task<[Int], Never> {
+      var received: [Int] = []
+      var iterator = asyncStream.makeAsyncIterator()
+
+      // Pull first value
+      if let first = await iterator.next() {
+        received.append(first)
+      }
+
+      // Sleep while the sender fires rapidly — values may be dropped
+      try? await Task.sleep(for: .milliseconds(300))
+
+      // Pull next available value
+      if let next = await iterator.next() {
+        received.append(next)
+      }
+
+      return received
+    }
+
+    // Send first value so the subscriber receives it before sleeping
+    await stream.send(0)
+
+    // Rapidly send 1..<20 while subscriber sleeps
+    for i in 1..<20 {
+      await stream.send(i)
+    }
+
+    // Give the subscriber time to finish the sleep and second pull
+    try await Task.sleep(for: .milliseconds(350))
+    // Send a trailing value in case the buffer was fully drained
+    await stream.send(20)
+
+    let values = await subscriberTask.value
+
+    #expect(values.first == 0, "Subscriber must receive the first value")
+    #expect(values.count >= 1, "Stream must not be dead after drops — subscriber gets at least one value")
+    #expect(values.count <= 20, "Total received must not exceed the number of values sent")
+    // Values that do arrive must be from the sent set
+    #expect(values.allSatisfy { (0...20).contains($0) }, "All received values must be from the sent set")
+  }
+
   // MARK: - Performance and Stress Tests
 
   @Test("Handles large number of values efficiently")
@@ -543,13 +669,12 @@ struct PassthroughStreamTests {
     #expect(values2 == ["B1", "B2"], "Second stream should only receive its own values")
   }
 
-  // MARK: - Deallocation Tests
+  // MARK: - Finish Tests
 
-  @Test("Subscriber stream ends when PassthroughStream is deallocated")
-  func subscriberEndsOnDeallocation() async {
-    // The subscriber's for-await loop should not hang forever after the stream is released.
-    var optionalStream: PassthroughStream<Int>? = PassthroughStream<Int>()
-    let asyncStream = await optionalStream!.stream()
+  @Test("Subscriber stream ends when finish() is called")
+  func subscriberEndsOnFinish() async {
+    let stream = PassthroughStream<Int>()
+    let asyncStream = await stream.stream()
 
     let collectedTask = Task {
       var values: [Int] = []
@@ -559,20 +684,43 @@ struct PassthroughStreamTests {
       return values
     }
 
-    // Send a value while alive
-    await optionalStream!.send(1)
+    // Send a value, then finish
+    await stream.send(1)
+    await stream.finish()
 
-    // Deallocate the stream — onTermination on the continuation fires, which
-    // calls removeContinuation. The AsyncStream continuation is never explicitly
-    // finished, so the for-await loop will not terminate on its own. Cancel the
-    // task to unblock it, verifying it can be cancelled without hanging.
-    optionalStream = nil
-
-    // Give the dealloc a moment to propagate
-    try? await Task.sleep(for: .milliseconds(50))
-
-    collectedTask.cancel()
+    // The for-await loop should exit on its own after finish()
     let values = await collectedTask.value
-    #expect(values.contains(1), "Should have received the value sent before deallocation")
+    #expect(values.contains(1), "Should have received the value sent before finish()")
+  }
+
+  @Test("send() after finish() does nothing")
+  func sendAfterFinishDoesNothing() async {
+    let stream = PassthroughStream<Int>()
+    let asyncStream = await stream.stream()
+    let collector = StreamCollector<Int>()
+
+    async let collected = collector.collectUntilTimeout(from: asyncStream, timeout: .milliseconds(200))
+
+    await stream.finish()
+
+    // These sends should be no-ops — no crash, no values delivered
+    await stream.send(1)
+    await stream.send(2)
+
+    let values = await collected
+    #expect(values.isEmpty, "No values should be delivered after finish()")
+  }
+
+  @Test("stream() after finish() returns a stream that immediately finishes")
+  func streamAfterFinishImmediatelyFinishes() async {
+    let stream = PassthroughStream<Int>()
+    await stream.finish()
+
+    // New subscriber created after finish — should get no values and exit promptly
+    let asyncStream = await stream.stream()
+    let collector = StreamCollector<Int>()
+
+    let values = await collector.collectUntilTimeout(from: asyncStream, timeout: .milliseconds(200))
+    #expect(values.isEmpty, "Stream created after finish() should deliver no values")
   }
 }
